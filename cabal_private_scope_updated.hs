@@ -430,15 +430,8 @@ main = do
 
   do_solve initialGoals simpleDB
 
-do_solve :: [(QPN, VersionRange)] -> PackageDB -> IO ()
-do_solve initialGoals db = do
-  let solutions = nubOrd $ runRWST (mapM (solve db Map.empty Map.empty []) initialGoals) () Map.empty
-      results = map (\(_, _, result) -> result) solutions
-      assignments = map (\(assignment, _, _) -> assignment) solutions
-
-  prettyPrintSolutions results
-
-  -- Print closure check results
+printClosureCheckResults :: [(a, Assignment, Result)] -> IO ()
+printClosureCheckResults solutions = do
   putStrLn "\n=== Closure Property Check ==="
   zipWithM_ (\i (_, assignment, result) -> do
     putStrLn $ "Solution " ++ show i ++ " closure check:"
@@ -460,5 +453,20 @@ do_solve initialGoals db = do
   where
     showQPNs = unwords . map (\(QPN _ pkgName, version) -> pkgName ++ "-" ++ show version)
 
+do_solve :: [(QPN, VersionRange)] -> PackageDB -> IO ()
+do_solve initialGoals db = do
+  let solutions = nubOrd $ runRWST (mapM (solve db Map.empty Map.empty []) initialGoals) () Map.empty
+      results = map (\(_, _, result) -> result) solutions
+      assignments = map (\(assignment, _, _) -> assignment) solutions
+
+  prettyPrintSolutions results
 
 
+-- | Test depending on the same package in two different scopes
+publicAndPrivateDB :: PackageDB
+publicAndPrivateDB = Map.fromList
+  [ ("A", Package "A" [1] $ \_ -> [ (PublicSrc, [Dependency "C" (VR [1])])
+                                  , (PrivateSrc "S", [Dependency "C" (VR [2])])])
+  , ("C", Package "C" [1, 2] $ \_ -> [(PublicSrc, [Dependency "base" (VR [1,2])])])
+  , ("base", Package "base" [1, 2] $ \_ -> [])
+  ]
