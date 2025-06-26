@@ -67,6 +67,15 @@ data RevDepMap = RevDepMap
 debugIndent :: Int -> String
 debugIndent depth = replicate (depth * 2) ' '
 
+-- Helper function for tracing guard failures
+traceGuard :: Int -> QPN -> String -> Bool -> RWST () Result Assignment [] ()
+traceGuard depth qpn reason condition = do
+  if condition
+    then return ()
+    else do
+      traceM $ debugIndent depth ++ "🚫 GUARD FAILED: " ++ showQPN qpn ++ " - " ++ reason
+      mzero
+
 showQPN :: QPN -> String
 showQPN (QPN scope pkgName) = pkgName ++ "[" ++ showScope scope ++ "]"
 
@@ -147,7 +156,7 @@ solve db scopes public_map path ((qpn@(QPN parentScope name), vr)) = do
   assignment <- get
   case Map.lookup qpn assignment of
     Just v | satisfies v vr -> do
-                guard $ checkClosedTop parentScope path
+                traceGuard depth qpn ("closure property check failed:" ++ showPath (qpn : path)) $ checkClosedTop parentScope path
                 traceM $ debugSolveCached depth qpn v
                 pure (qpn, v)
            | otherwise      -> do
@@ -156,8 +165,8 @@ solve db scopes public_map path ((qpn@(QPN parentScope name), vr)) = do
     Nothing -> do
       pkg <- lift $ maybeToList (Map.lookup name db)
       v   <- lift $ availableVers pkg
-      guard (satisfies v vr)
-      guard $ checkClosedTop parentScope path
+      traceGuard depth qpn ("version " ++ show v ++ " does not satisfy range " ++ showVersionRange vr) $ satisfies v vr
+      traceGuard depth qpn ("closure property check failed:" ++ showPath (qpn : path)) $ checkClosedTop parentScope path
       traceM $ debugSolveVersion depth qpn v
 
       -- Record our choice of assignment.
