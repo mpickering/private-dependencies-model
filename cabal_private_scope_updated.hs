@@ -1,4 +1,5 @@
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE DuplicateRecordFields #-}
 
 -- | Cabal Private Scope Solver
 -- This module implements a dependency solver that handles private scopes
@@ -53,13 +54,19 @@ data QPN = QPN
   }
   deriving (Eq, Ord, Show)
 
-data Package = Package
-  { pkgName       :: PackageName
-  , availableVers :: [Version]
-  , dependencies  :: Version -> [(SourceScope, [Dependency])]
+data PackageDBPackage = PackageDBPackage
+  { pkgName_db       :: PackageName
+  , availableVers_db :: [Version]
+  , dependencies_db  :: Version -> [(SourceScope, [Dependency])]
   }
 
-type PackageDB = Map PackageName Package
+data Package = Package
+  { pkgName       :: PackageName
+  , availableVers :: Version
+  , dependencies  :: [(SourceScope, [Dependency])]
+  }
+
+type PackageDB = Map PackageName PackageDBPackage
 type Assignment = Map QPN Version
 type Result = Map.Map QPN (Version, [(SourceScope, [(QPN, Version)])])
 
@@ -223,7 +230,7 @@ solve db scopes public_map path ((qpn@(QPN parentScope name), vr)) = do
                 mzero
     Nothing -> do
       pkg <- checkNonEmpty depth qpn "no package found" (maybeToList (Map.lookup name db))
-      v   <- checkNonEmpty depth qpn "no versions available" (availableVers pkg)
+      v   <- checkNonEmpty depth qpn "no versions available" (availableVers_db pkg)
 
       traceGuard depth qpn ("version " ++ show v ++ " does not satisfy range " ++ showVersionRange vr) $ satisfies v vr
       traceGuard depth qpn ("closure property check failed:" ++ showPath (qpn : path)) $ checkClosedTop parentScope path
@@ -235,7 +242,7 @@ solve db scopes public_map path ((qpn@(QPN parentScope name), vr)) = do
       -- Add the current package to its scope in the scopes map
       -- 1. The new scopes this package introduces
       let new_scopes :: Map ScopeType (Set.Set PackageName)
-          new_scopes = Map.fromList [(Private (PrivateScopeQualifier name v sc), Set.fromList (map depPackageName deps)) | (PrivateSrc sc, deps) <- dependencies pkg v]
+          new_scopes = Map.fromList [(Private (PrivateScopeQualifier name v sc), Set.fromList (map depPackageName deps)) | (PrivateSrc sc, deps) <- dependencies_db pkg v]
 
           -- 2. Unioned with the scopes from existing packages
           scopes' = scopes `Map.union` new_scopes
@@ -252,6 +259,8 @@ solve db scopes public_map path ((qpn@(QPN parentScope name), vr)) = do
               Nothing -> error "not found" -- Impossible, since the scope must be defined before it is used.
 
           -- 4. Get the scope for a public dependency of this package.
+          -- MP: Not sure if this should be transitive_scopes or public_map
+          -- One of the tests observes the difference but I need to check which one.
           get_dep_scope :: PackageName -> ScopeType
           get_dep_scope pn = case Map.lookup pn (transitive_scopes parentScope) of
             Just sc -> sc
@@ -262,7 +271,7 @@ solve db scopes public_map path ((qpn@(QPN parentScope name), vr)) = do
 
       let path' = qpn : path
 
-      let deps = dependencies pkg v
+      let deps = dependencies_db pkg v
       traceM $ debugSolveDeps depth deps
 
       deps <- mapM ((\(sc, ds) -> (sc,) <$> mapM (solve db scopes' (transitive_scopes parentScope) path') (mkQDeps sc ds))) deps
@@ -399,61 +408,108 @@ checkClosureProperty assignment result =
   all (\(_, check) -> check == Closed) (checkClosurePropertyDetailed assignment result)
 
 -- =============================================================================
+-- PackageDB DSL
+-- =============================================================================
+
+type Dependencies = [(SourceScope, [Dependency])]
+
+combinePackageDBPackage :: PackageDBPackage -> PackageDBPackage -> PackageDBPackage
+combinePackageDBPackage p1 p2
+  | pkgName_db p1 == pkgName_db p2 = PackageDBPackage
+  { pkgName_db = pkgName_db p1
+  , availableVers_db = availableVers_db p1 ++ availableVers_db p2
+  , dependencies_db = \v -> dependencies_db p1 v ++ dependencies_db p2 v -- TODO: This is wrong.
+  }
+  | otherwise = error "combinePackageDBPackage: different package names"
+
+mkPackageDBPackage :: Package -> PackageDBPackage
+mkPackageDBPackage (Package name version deps) = PackageDBPackage
+  { pkgName_db = name
+  , availableVers_db = [version]
+  , dependencies_db = \v -> if v == version then deps else []
+  }
+
+mkPackageDB :: [Package] -> PackageDB
+mkPackageDB ps = Map.fromListWith combinePackageDBPackage $ map (\p -> (pkgName p, mkPackageDBPackage p)) ps
+
+-- =============================================================================
 -- Test Databases
 -- =============================================================================
 
 -- | Example: C -> B -> A -> D, with no new nested private scopes
 exampleDB :: PackageDB
-exampleDB = Map.fromList
-  [ ("C", Package "C" [1] $ \_ -> [(PublicSrc, [Dependency "B" (VR [1])])])
-  , ("B", Package "B" [1] $ \_ -> [(PublicSrc, [Dependency "A" (VR [1])])])
-  , ("A", Package "A" [1] $ \_ -> [(PublicSrc, [Dependency "D" (VR [1])])])
-  , ("D", Package "D" [1] $ \_ -> [(PublicSrc, [])])
-  , ("S", Package "S" [1] $ \_ -> [(PrivateSrc "S", [Dependency "C" (VR [1]),Dependency "A" (VR [1])])])
+exampleDB = mkPackageDB
+  [ Package "C" 1 [(PublicSrc, [Dependency "B" (VR [1])])]
+  , Package "B" 1 [(PublicSrc, [Dependency "A" (VR [1])])]
+  , Package "A" 1 [(PublicSrc, [Dependency "D" (VR [1])])]
+  , Package "D" 1 [(PublicSrc, [])]
+  , Package "S" 1 [(PrivateSrc "S", [Dependency "C" (VR [1]),Dependency "A" (VR [1])])]
   ]
 
 -- | This needs to force B into private scope
 simpleDB :: PackageDB
-simpleDB = Map.fromList
-  [ ("A", Package "A" [1] $ \_ -> [(PublicSrc, [Dependency "B" (VR [1])])])
-  , ("B", Package "B" [1] $ \_ -> [(PublicSrc, [Dependency "C" (VR [1])])])
-  , ("C", Package "C" [1] $ \_ -> [])
-  , ("S", Package "S" [1] $ \_ -> [(PrivateSrc "S", [Dependency "C" (VR [1]), Dependency "A" (VR [1])])])
+simpleDB = mkPackageDB
+  [ Package "A" 1 [(PublicSrc, [Dependency "B" (VR [1])])]
+  , Package "B" 1 [(PublicSrc, [Dependency "C" (VR [1])])]
+  , Package "C" 1 []
+  , Package "S" 1 [(PrivateSrc "S", [Dependency "C" (VR [1]), Dependency "A" (VR [1])])]
   ]
 
 simpleDB2 :: PackageDB
-simpleDB2 = Map.fromList
-  [ ("A", Package "A" [1] $ \_ -> [(PublicSrc, [Dependency "B" (VR [1])])])
-  , ("B", Package "B" [1] $ \_ -> [(PublicSrc, [Dependency "C" (VR [1])])])
-  , ("C", Package "C" [1] $ \_ -> [])
-  , ("S", Package "S" [1] $ \_ -> [(PrivateSrc "S", [Dependency "C" (VR [1]), Dependency "B" (VR [1]), Dependency "A" (VR [1])])])
+simpleDB2 = mkPackageDB
+  [ Package "A" 1 [(PublicSrc, [Dependency "B" (VR [1])])]
+  , Package "B" 1 [(PublicSrc, [Dependency "C" (VR [1])])]
+  , Package "C" 1 []
+  , Package "S" 1 [(PrivateSrc "S", [Dependency "C" (VR [1]), Dependency "B" (VR [1]), Dependency "A" (VR [1])])]
   ]
 
 simplestDB :: PackageDB
-simplestDB = Map.fromList
-  [ ("B", Package "B" [1] $ \_ -> [(PublicSrc, [Dependency "C" (VR [1, 2])])])
-  , ("C", Package "C" [1, 2, 3] $ \_ -> [])
+simplestDB = mkPackageDB $
+  [ Package "B" 1 [(PublicSrc, [Dependency "C" (VR [1, 2])])]
   ]
+  ++ [ Package "C" n [] | n <- [1..3]]
 
 -- | Test depending on the same package in two different scopes
 publicAndPrivateDB :: PackageDB
-publicAndPrivateDB = Map.fromList
-  [ ("A", Package "A" [1] $ \_ -> [ (PublicSrc, [Dependency "C" (VR [1])])
-                                  , (PrivateSrc "S", [Dependency "C" (VR [2])])])
-  , ("C", Package "C" [1, 2] $ \_ -> [(PublicSrc, [Dependency "base" (VR [1,2])])])
-  , ("base", Package "base" [1, 2] $ \_ -> [])
+publicAndPrivateDB = mkPackageDB $
+  [  Package "A" 1 [ (PublicSrc, [Dependency "C" (VR [1])])
+                   , (PrivateSrc "S", [Dependency "C" (VR [2])])]
   ]
+  ++ [ Package "C" n [(PublicSrc, [Dependency "base" (VR [1,2])])] | n <- [1,2]]
+  ++ [ Package "base" n [] | n <- [1,2] ]
 
 d1 :: PackageName -> Dependency
 d1 pn = Dependency pn (VR [1])
 
 kristen1 :: PackageDB
-kristen1 = Map.fromList
-  [ ("library-user", Package "library-user" [1] $ \_ -> [(PrivateSrc "L", [d1 "my-library", d1 "containers"])])
-  , ("my-library", Package "my-library" [1] $ \_ -> [(PublicSrc, [d1 "containers"])
-                                                    ,(PrivateSrc "M", [d1 "private-container-utils"])])
-  , ("private-container-utils", Package "private-container-utils" [1] $ \_ -> [(PublicSrc, [d1 "containers"])])
-  , ("containers", Package "containers" [1] $ \_ -> [(PublicSrc, [])])
+kristen1 = mkPackageDB $
+  [ Package "library-user" 1 [(PrivateSrc "L", [d1 "my-library", d1 "containers"])]
+  , Package "my-library" 1 [(PublicSrc, [d1 "containers"])
+                            ,(PrivateSrc "M", [d1 "private-container-utils"])]
+  , Package "private-container-utils" 1 [(PublicSrc, [d1 "containers"])]
+  , Package "containers" 1 [(PublicSrc, [])]
+  ]
+
+public :: [Dependency] -> (SourceScope, [Dependency])
+public ds = (PublicSrc, ds)
+
+private :: String -> [Dependency] -> (SourceScope, [Dependency])
+private sc ds = (PrivateSrc sc, ds)
+
+d2 :: PackageName -> Dependency
+d2 pn = d 2 pn
+
+d :: Int -> PackageName -> Dependency
+d n pn = Dependency pn (VR [n])
+
+matthew1 :: PackageDB
+matthew1 = mkPackageDB $
+  [ Package "S" 1 [ public [d1 "Cabal", d1 "Cabal-syntax"]
+                  , private "S" [d2 "Cabal", d2 "Cabal-syntax"] ]
+  , Package "Cabal" 1 [ public [d1 "Cabal-syntax"] ]
+  , Package "Cabal-syntax" 1 [ public [] ]
+  , Package "Cabal" 2 [ public [d2 "Cabal-syntax"] ]
+  , Package "Cabal-syntax" 2 [ public [] ]
   ]
 
 -- =============================================================================
@@ -506,6 +562,9 @@ test_checkClosed = do
 
   putStrLn "checkClosed unit tests completed.\n"
 
+topGoal :: PackageName -> Int -> (QPN, VersionRange)
+topGoal pn n = (QPN Public pn, VR [n])
+
 main :: IO ()
 main = do
   -- Uncomment to run unit tests
@@ -518,4 +577,6 @@ main = do
   -- do_solve initialGoals exampleDB
   -- do_solve initialGoals publicAndPrivateDB
 
-  do_solve initialGoals simpleDB
+--  do_solve initialGoals simpleDB
+
+  do_solve [topGoal "S" 1] matthew1
